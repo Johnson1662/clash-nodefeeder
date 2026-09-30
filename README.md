@@ -77,6 +77,10 @@ journalctl --user -u nodefeeder -f               # 看日志
 | `clash.list_file` / `provider` | 名单文件名 / Clash 里的 provider 名，**两边必须一致** |
 | `clash.control` | `auto` 优先用 Verge 的 unix socket，其次读运行配置里的控制口 |
 | `clash.verify_port` | 填上你 Clash 的混合端口（如 7897），`doctor` 会顺便实测出口 |
+| `serve.enable` | 是否随守护开启订阅服务 |
+| `serve.bind` / `port` | 监听地址与端口（默认只听 `127.0.0.1`，留给隧道） |
+| `serve.token` | 路径里的随机口令段，建议设置 |
+| `serve.public_url` | 手机会用到的公网地址，会写进生成的 `profile.yaml` |
 
 ## 命令
 
@@ -89,8 +93,32 @@ once      fetch + filter + pick，跑完退出
 run       常驻循环
 doctor    自检：源可达性、池子、内核、Clash 接线、出口 IP
 profile   生成可导入的 Clash 配置（provider 路径按你的配置填好）
+serve     起一个只读的订阅服务（给手机或第二台机器用）
 install / uninstall   systemd --user 单元
 ```
+
+## 在手机上用同一份名单
+
+手机不需要跑这套工具，它只要能订阅到这份名单：
+
+```bash
+python3 nodefeeder.py serve          # 前台跑，实时看访问日志；或让 run 随守护一起起
+```
+
+接到公网：任何能把 HTTP 指到本机的隧道都行（Cloudflare Tunnel、FRP……）。
+**别指望 Tailscale**：手机上的 Clash 和 Tailscale 抢同一个 VPN 位，两者不能同时开。
+
+手机上二选一订阅：
+
+| 客户端 | 订阅地址 |
+|---|---|
+| Clash 系（Clash Meta for Android 等） | `https://<域名>/<token>/profile.yaml` |
+| v2rayNG / Shadowrocket / NekoBox | `https://<域名>/<token>/sub.txt` |
+
+那份 `profile.yaml` 内部是 `type: http` 的 provider，指向同一目录下的 `nodes.txt`，
+所以本机名单更新后手机会自己拉——不用重新订阅。
+
+`serve.token` 等于一个口令：**谁拿到这个 URL 谁就能拿走名单**，别贴到公开地方。
 
 ## 为什么名单里只有 8 个
 

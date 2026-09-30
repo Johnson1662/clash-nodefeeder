@@ -14,7 +14,10 @@ import os
 import random
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location("nodefeeder", os.path.join(ROOT, "nodefeeder.py"))
@@ -207,6 +210,84 @@ class SourceFetching(unittest.TestCase):
         _, count, _ = nf.fetch_source(self.cfg, "someone/repo/main/sub")
         self.assertEqual(count, 1)
         self.assertEqual(len(calls), 2)
+
+
+class Subscription(unittest.TestCase):
+    """What other devices pull: share links, a base64 list, and a Clash profile."""
+
+    def setUp(self):
+        self.cfg = nf.deep_merge(
+            nf.DEFAULTS,
+            {"state_dir": tempfile.mkdtemp(),
+             "serve": {"bind": ["127.0.0.1"], "port": 7691, "token": "s3cret"}},
+        )
+        self.links = ["trojan://pw@1.2.3.4:443#a", "ss://x@2.2.2.2:80#b"]
+
+    def test_base_url_uses_first_bind_and_token(self):
+        self.assertEqual(nf.sub_base_url(self.cfg), "http://127.0.0.1:7691/s3cret")
+
+    def test_public_url_wins_over_bind(self):
+        cfg = nf.deep_merge(self.cfg, {"serve": {"public_url": "https://nodes.example.com/"}})
+        self.assertEqual(nf.sub_base_url(cfg), "https://nodes.example.com/s3cret")
+
+    def test_writes_links_base64_and_profile(self):
+        nf.write_subscription(self.cfg, self.links)
+        directory = nf.sub_dir(self.cfg)
+        self.assertEqual(nf.read_lines(os.path.join(directory, "nodes.txt")), self.links)
+        with open(os.path.join(directory, "sub.txt"), encoding="utf-8") as fh:
+            decoded = base64.b64decode(fh.read()).decode()
+        self.assertEqual(decoded.split(), self.links)
+        with open(os.path.join(directory, "profile.yaml"), encoding="utf-8") as fh:
+            profile = fh.read()
+        # The profile must point the client at the http provider, not at a local file.
+        self.assertIn("type: http", profile)
+        self.assertIn("url: http://127.0.0.1:7691/s3cret/nodes.txt", profile)
+
+    def test_nothing_is_written_for_an_empty_list(self):
+        nf.write_subscription(self.cfg, [])
+        self.assertFalse(os.path.exists(nf.sub_dir(self.cfg)))
+
+
+class Serving(unittest.TestCase):
+    def setUp(self):
+        self.cfg = nf.deep_merge(
+            nf.DEFAULTS,
+            {"state_dir": tempfile.mkdtemp(),
+             "serve": {"enable": True, "bind": ["127.0.0.1"], "port": 0, "token": "tok"}},
+        )
+        nf.write_subscription(self.cfg, ["trojan://pw@1.2.3.4:443#a"])
+        self.servers = nf.build_servers(self.cfg)
+        self.port = self.servers[0].server_address[1]
+        threading.Thread(target=self.servers[0].serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        for server in self.servers:
+            server.shutdown()
+            server.server_close()
+
+    def get(self, path):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as resp:
+                return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, ""
+
+    def test_token_path_serves_the_list(self):
+        status, body = self.get("/tok/nodes.txt")
+        self.assertEqual(status, 200)
+        self.assertIn("trojan://", body)
+
+    def test_requests_without_the_token_are_hidden(self):
+        self.assertEqual(self.get("/nodes.txt")[0], 404)
+        self.assertEqual(self.get("/")[0], 404)
+
+    def test_directory_listing_is_refused(self):
+        self.assertEqual(self.get("/tok/")[0], 403)
+
+    def test_files_outside_the_sub_directory_are_unreachable(self):
+        with open(os.path.join(self.cfg["state_dir"], "list.txt"), "w", encoding="utf-8") as fh:
+            fh.write("trojan://secret@9.9.9.9:443#private\n")
+        self.assertEqual(self.get("/tok/../list.txt")[0], 404)
 
 
 if __name__ == "__main__":

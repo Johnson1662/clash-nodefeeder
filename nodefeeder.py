@@ -38,6 +38,7 @@ import argparse
 import base64
 import concurrent.futures as cf
 import http.client
+import http.server
 import json
 import os
 import random
@@ -46,11 +47,12 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 USER_AGENT = f"nodefeeder/{VERSION} (+https://github.com/Johnson1662/clash-nodefeeder)"
 
 # Public node sources. Every one of these is a third party that can rename a repo,
@@ -121,6 +123,21 @@ DEFAULTS = {
         # Optional: a local proxy port to sanity-check in `doctor`.
         "verify_port": 0,
         "verify_url": "https://ipinfo.io/ip",
+    },
+    "serve": {
+        # Off by default. Turn it on to let other devices (a phone, another laptop)
+        # subscribe to the same list over HTTP instead of copying files around.
+        "enable": False,
+        # Addresses to bind. Keep 127.0.0.1 for a tunnel; add the machine's private
+        # or tailnet address for phones. Avoid 0.0.0.0 on a shared network: anyone
+        # on it could then fetch your list.
+        "bind": ["127.0.0.1"],
+        "port": 7691,
+        # Optional random path segment: every request must start with /<token>/.
+        "token": "",
+        # What clients should use to reach the server (baked into the profile we
+        # generate). e.g. http://100.90.54.43:7691 or https://nodes.example.com
+        "public_url": "",
     },
 }
 
@@ -488,6 +505,7 @@ def cmd_pick(cfg: dict) -> int:
         save_status(cfg, {"probed": len(sample), "winners": 0, "reload": "skipped"})
         return 1
     write_lines(state_path(cfg, "list.txt"), kept, 1)
+    write_subscription(cfg, kept)
     result = publish_to_clash(cfg, kept)
     save_status(cfg, {"probed": len(sample), "winners": len(winners), "list": len(kept), "reload": result})
     return 0
@@ -586,9 +604,160 @@ def publish_to_clash(cfg: dict, lines: list[str]) -> str:
     log(
         f"clash: wrote {target_file}, but reload returned HTTP {status} -- "
         f"is the provider `{cfg['clash']['provider']}` in your Clash profile? "
-        "see examples/clash-router.yaml"
+        "run `nodefeeder profile` and import what it writes"
     )
     return f"http-{status}"
+
+
+# --------------------------------------------------------------- other devices
+
+
+PHONE_PROFILE = """# nodefeeder -- subscription profile for a phone or a second machine.
+#
+# The node list is pulled over HTTP (proxy-providers, type: http), so it refreshes
+# by itself: nothing to copy around when the list changes.
+proxy-providers:
+  {provider}:
+    type: http
+    url: {nodes_url}
+    path: ./{provider}-provider.yaml
+    interval: {interval}
+    health-check:
+      enable: true
+      url: http://www.gstatic.com/generate_204
+      interval: 300
+
+proxy-groups:
+  - name: "auto-nodes"
+    type: url-test
+    use: [{provider}]
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+  - name: "spare-router"
+    type: fallback
+    proxies: ["auto-nodes", DIRECT]
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+
+rules:
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,spare-router
+"""
+
+
+def sub_dir(cfg: dict) -> str:
+    return os.path.join(expand(cfg["state_dir"]), "sub")
+
+
+def sub_base_url(cfg: dict) -> str:
+    base = (cfg["serve"]["public_url"] or "").rstrip("/")
+    if not base:
+        host = (cfg["serve"]["bind"] or ["127.0.0.1"])[0]
+        base = f"http://{host}:{cfg['serve']['port']}"
+    token = cfg["serve"]["token"].strip("/")
+    return f"{base}/{token}" if token else base
+
+
+def write_subscription(cfg: dict, lines: list[str]) -> None:
+    """What other devices subscribe to: share links, a base64 list and a Clash profile."""
+    if not lines:
+        return
+    directory = sub_dir(cfg)
+    os.makedirs(directory, exist_ok=True)
+    payload = "\n".join(lines) + "\n"
+    with open(os.path.join(directory, "nodes.txt"), "w", encoding="utf-8") as fh:
+        fh.write(payload)
+    with open(os.path.join(directory, "sub.txt"), "w", encoding="utf-8") as fh:
+        fh.write(base64.b64encode(payload.encode()).decode() + "\n")
+    profile = PHONE_PROFILE.format(
+        provider=cfg["clash"]["provider"],
+        nodes_url=f"{sub_base_url(cfg)}/nodes.txt",
+        interval=int(cfg["schedule"]["interval"]),
+    )
+    with open(os.path.join(directory, "profile.yaml"), "w", encoding="utf-8") as fh:
+        fh.write(profile)
+    log(f"sub: {len(lines)} nodes -> {directory} (nodes.txt, sub.txt, profile.yaml)")
+
+
+def make_handler(cfg: dict):
+    """Read-only handler confined to the sub directory, with an optional path token."""
+    directory = sub_dir(cfg)
+    token = cfg["serve"]["token"].strip("/")
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=directory, **kwargs)
+
+        def _resolve(self) -> str | None:
+            """Path with the token removed, or None when the request is not allowed."""
+            if not token:
+                return self.path
+            head, _, rest = self.path.lstrip("/").partition("/")
+            if head != token:
+                return None
+            return "/" + rest
+
+        def _send(self, head_only: bool) -> None:
+            path = self._resolve()
+            if path is None:
+                self.send_error(404)
+                return
+            self.path = path
+            if head_only:
+                super().do_HEAD()
+            else:
+                super().do_GET()
+
+        def do_GET(self):
+            self._send(head_only=False)
+
+        def do_HEAD(self):
+            self._send(head_only=True)
+
+        def list_directory(self, path):
+            # Never expose what else lives in the state directory.
+            self.send_error(403, "no directory listing")
+            return None
+
+        def log_message(self, fmt, *args):
+            log(f"sub: {self.address_string()} {fmt % args}")
+
+    return Handler
+
+
+def build_servers(cfg: dict) -> list:
+    handler = make_handler(cfg)
+    servers = []
+    for host in cfg["serve"]["bind"] or ["127.0.0.1"]:
+        try:
+            server = http.server.ThreadingHTTPServer((host, int(cfg["serve"]["port"])), handler)
+        except OSError as exc:
+            log(f"serve: cannot bind {host}:{cfg['serve']['port']} ({exc})")
+            continue
+        servers.append(server)
+        log(f"serve: {sub_dir(cfg)} on http://{host}:{server.server_address[1]}/")
+    return servers
+
+
+def cmd_serve(cfg: dict) -> int:
+    base = sub_base_url(cfg)
+    print(f"clash  : {base}/profile.yaml")
+    print(f"v2rayNG: {base}/sub.txt")
+    servers = build_servers(cfg)
+    if not servers:
+        return 1
+    try:
+        for server in servers:
+            server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 # ------------------------------------------------------------------------- commands
@@ -603,6 +772,8 @@ def cmd_once(cfg: dict, force_fetch: bool = False, round_no: int = 1) -> int:
 
 def cmd_run(cfg: dict) -> int:
     interval = int(cfg["schedule"]["interval"])
+    for server in build_servers(cfg) if cfg["serve"]["enable"] else []:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
     round_no = 0
     while True:
         round_no += 1
@@ -837,6 +1008,8 @@ def main(argv: list[str] | None = None) -> int:
     profile = sub.add_parser("profile", parents=[common],
                              help="write a ready-to-import Clash profile for the list")
     profile.add_argument("--out", default="", help="where to write it (default: the state dir)")
+    sub.add_parser("serve", parents=[common],
+                   help="serve the subscription files (for a phone or another machine)")
     sub.add_parser("install", parents=[common], help="write and reload a systemd --user unit")
     sub.add_parser("uninstall", parents=[common], help="remove the systemd --user unit")
 
@@ -867,6 +1040,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(cfg)
     if args.command == "profile":
         return cmd_profile(cfg, args.out)
+    if args.command == "serve":
+        return cmd_serve(cfg)
     return 2
 
 

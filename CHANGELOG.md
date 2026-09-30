@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 — 2026-09-30
+
+- 新增 `serve`：内置只读 HTTP 服务，让手机/第二台机器订阅同一份名单（路径可用随机 token 保护，绝不列目录，只暴露订阅文件）
+- `pick` 除了喂给本机 Clash，还会写 `sub/` 三份文件：`nodes.txt`（分享链接）、`sub.txt`（base64，通用订阅格式）、`profile.yaml`（Clash 系客户端用的配置，内部是 `type: http` 的 provider，名单更新后客户端自己拉）
+- 新增 `serve.public_url`：把对外的公开地址烤进 `profile.yaml`，手机拿到的就是公网地址
+- 文档补充「在手机上用」一节，写明手机端 Clash 与 Tailscale 抢同一个 VPN 位、不能指望 Tailscale 直连这条路
+- 新测试 8 个：订阅文件内容、base64 往返、token 路径、无 token 404、不列目录、`..` 越不出订阅目录
 ## 0.1.0 — 2026-09-30
 
 首个公开版本，由一个自用脚本集重写而来。
