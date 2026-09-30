@@ -1,0 +1,17 @@
+# generated state (never share a node list by accident)
+pool.txt
+alive.txt
+list.txt
+status.json
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
