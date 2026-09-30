@@ -664,6 +664,14 @@ def sub_base_url(cfg: dict) -> str:
     return f"{base}/{token}" if token else base
 
 
+def render_phone_profile(cfg: dict, base_url: str) -> str:
+    return PHONE_PROFILE.format(
+        provider=cfg["clash"]["provider"],
+        nodes_url=f"{base_url.rstrip('/')}/nodes.txt",
+        interval=int(cfg["schedule"]["interval"]),
+    )
+
+
 def write_subscription(cfg: dict, lines: list[str]) -> None:
     """What other devices subscribe to: share links, a base64 list and a Clash profile."""
     if not lines:
@@ -675,13 +683,8 @@ def write_subscription(cfg: dict, lines: list[str]) -> None:
         fh.write(payload)
     with open(os.path.join(directory, "sub.txt"), "w", encoding="utf-8") as fh:
         fh.write(base64.b64encode(payload.encode()).decode() + "\n")
-    profile = PHONE_PROFILE.format(
-        provider=cfg["clash"]["provider"],
-        nodes_url=f"{sub_base_url(cfg)}/nodes.txt",
-        interval=int(cfg["schedule"]["interval"]),
-    )
     with open(os.path.join(directory, "profile.yaml"), "w", encoding="utf-8") as fh:
-        fh.write(profile)
+        fh.write(render_phone_profile(cfg, sub_base_url(cfg)))
     log(f"sub: {len(lines)} nodes -> {directory} (nodes.txt, sub.txt, profile.yaml)")
 
 
@@ -707,6 +710,22 @@ def make_handler(cfg: dict):
             path = self._resolve()
             if path is None:
                 self.send_error(404)
+                return
+            if path.rstrip("/").endswith("profile.yaml"):
+                # Answer with the host the client actually reached us on: a client
+                # that can resolve one name but not the other must still get a
+                # profile whose provider URL it can fetch.
+                host_header = self.headers.get("Host") or ""
+                base = f"https://{host_header}" if host_header else sub_base_url(cfg)
+                if token:
+                    base = f"{base}/{token}"
+                body = render_phone_profile(cfg, base).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/yaml; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if not head_only:
+                    self.wfile.write(body)
                 return
             self.path = path
             if head_only:

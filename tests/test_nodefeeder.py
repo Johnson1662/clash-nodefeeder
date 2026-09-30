@@ -265,9 +265,11 @@ class Serving(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
-    def get(self, path):
+    def get(self, path, host=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        request = urllib.request.Request(url, headers={"Host": host} if host else {})
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as resp:
+            with urllib.request.urlopen(request, timeout=5) as resp:
                 return resp.status, resp.read().decode()
         except urllib.error.HTTPError as exc:
             return exc.code, ""
@@ -280,6 +282,13 @@ class Serving(unittest.TestCase):
     def test_requests_without_the_token_are_hidden(self):
         self.assertEqual(self.get("/nodes.txt")[0], 404)
         self.assertEqual(self.get("/")[0], 404)
+
+    def test_served_profile_uses_the_host_the_client_asked_for(self):
+        # A phone that can resolve one public name but not another must still get a
+        # profile whose provider URL points at something it can fetch.
+        status, body = self.get("/tok/profile.yaml", host="phone.example.com")
+        self.assertEqual(status, 200)
+        self.assertIn("url: https://phone.example.com/tok/nodes.txt", body)
 
     def test_directory_listing_is_refused(self):
         self.assertEqual(self.get("/tok/")[0], 403)
